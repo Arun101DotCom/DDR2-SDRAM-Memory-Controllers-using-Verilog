@@ -1,0 +1,117 @@
+module ddr2_controller (
+    input clk,               // Controller Clock
+    input reset_n,           // Active Low Reset
+    input init_start,        // Trigger for Initialization sequence
+    
+    // Processor Interface
+    input [24:0] addr_in,    // {Bank, Row, Column}
+    input [2:0]  cmd_in,     // 001: READ, 010: WRITE, 100: PRECHARGE
+    input [15:0] data_in,    // Data to write
+    output [15:0] data_out,  // Data read
+    output ready,            // Controller ready for commands
+    
+    // Physical DDR2 Interface
+    output [12:0] ddr_addr,
+    output [1:0]  ddr_ba,
+    output ddr_ras_n, ddr_cas_n, ddr_we_n, ddr_cs_n,
+    output ddr_cke, ddr_odt,
+    inout [15:0] ddr_dq,
+    inout [1:0]  ddr_dqs
+);
+
+    // Internal signals for FSM
+    wire [3:0] current_cmd;
+    assign {ddr_cs_n, ddr_ras_n, ddr_cas_n, ddr_we_n} = current_cmd;
+
+    // Instance of Initialization Engine
+    ddr2_init_engine init_unit (
+        .clk(clk),
+        .reset_n(reset_n),
+        .start(init_start),
+        .ready(ready),
+        .init_cmd(current_cmd),
+        .init_addr(ddr_addr),
+        .init_ba(ddr_ba)
+    );
+
+    // Logic for ODT (On-Die Termination)
+    assign ddr_odt = (cmd_in == 3'b010) ? 1'b1 : 1'b0; // Enabled during WRITE
+
+endmodule
+
+module ddr2_fsm (
+    input clk,
+    input reset_n,
+    input [2:0] user_cmd,
+    output reg [3:0] ddr_cmd_out,
+    output reg [12:0] ddr_addr_out
+);
+    // Command Encoding (CS, RAS, CAS, WE)
+    parameter CMD_NOP       = 4'b0111;
+    parameter CMD_ACTIVATE  = 4'b0011;
+    parameter CMD_READ      = 4'b0101;
+    parameter CMD_WRITE     = 4'b0100;
+    parameter CMD_PRECHARGE = 4'b0010;
+
+    // State Machine
+    typedef enum reg [2:0] {IDLE, ACT, RW_WAIT, PRE} state_t;
+    state_t state, next_state;
+
+    always @(posedge clk or negedge reset_n) begin
+        if (!reset_n) state <= IDLE;
+        else state <= next_state;
+    end
+
+    always @(*) begin
+        case (state)
+            IDLE: begin
+                ddr_cmd_out = CMD_NOP;
+                if (user_cmd != 3'b000) next_state = ACT;
+                else next_state = IDLE;
+            end
+            ACT: begin
+                ddr_cmd_out = CMD_ACTIVATE;
+                next_state = RW_WAIT;
+            end
+            RW_WAIT: begin
+                if (user_cmd == 3'b001) ddr_cmd_out = CMD_READ;
+                else ddr_cmd_out = CMD_WRITE;
+                next_state = PRE;
+            end
+            PRE: begin
+                ddr_cmd_out = CMD_PRECHARGE;
+                next_state = IDLE;
+            end
+            default: next_state = IDLE;
+        endcase
+    end
+endmodule
+
+module ddr2_init_engine (
+    input clk,
+    input reset_n,
+    input start,
+    output reg ready,
+    output reg [3:0] init_cmd,
+    output reg [12:0] init_addr,
+    output reg [1:0] init_ba
+);
+    reg [7:0] step;
+
+    always @(posedge clk or negedge reset_n) begin
+        if (!reset_n) begin
+            step <= 0;
+            ready <= 0;
+        end else if (start && !ready) begin
+            case (step)
+                0: begin init_cmd <= 4'b0010; init_addr[10] <= 1; step <= 1; end // Precharge All
+                1: begin init_cmd <= 4'b0000; init_ba <= 2'b01; step <= 2; end   // EMR (Enable DLL)
+                2: begin init_cmd <= 4'b0000; init_ba <= 2'b00; init_addr <= 13'h100; step <= 3; end // MR (Reset DLL)
+                3: begin init_cmd <= 4'b0010; init_addr[10] <= 1; step <= 4; end // Precharge All again
+                4: begin init_cmd <= 4'b0001; step <= 5; end                    // Refresh
+                5: begin init_cmd <= 4'b0001; step <= 6; end                    // Refresh
+                6: begin ready <= 1; end // Initialization Complete
+            endcase
+        end
+    end
+endmodule
